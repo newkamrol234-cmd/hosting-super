@@ -7,6 +7,10 @@ import json
 import time
 import random
 import ssl
+import os
+import subprocess
+import sys
+import atexit
 
 app = Flask(__name__)
 
@@ -27,6 +31,76 @@ def serialize_doc(doc):
     if doc and '_id' in doc:
         doc['_id'] = str(doc['_id'])
     return doc
+
+# ==========================================
+# BOT RUNNER CORE
+# ==========================================
+BOTS_DIR = "running_bots"
+os.makedirs(BOTS_DIR, exist_ok=True)
+active_processes = {}
+
+def start_bot(bot_id, code):
+    """Starts the bot in a separate background process."""
+    stop_bot(bot_id)  # Stop any existing instance first
+    
+    script_path = os.path.join(BOTS_DIR, f"{bot_id}.py")
+    log_path = os.path.join(BOTS_DIR, f"{bot_id}.log")
+    
+    # Write the user code to a physical Python file
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(code)
+        
+    # Open log file to capture print statements and errors
+    log_file = open(log_path, "w", encoding="utf-8")
+    
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            stdout=log_file,
+            stderr=subprocess.STDOUT
+        )
+        active_processes[bot_id] = {'proc': proc, 'log_file': log_file}
+        print(f"✅ Bot {bot_id} started successfully. PID: {proc.pid}")
+    except Exception as e:
+        print(f"❌ Failed to start bot {bot_id}: {e}")
+        log_file.write(f"\n[SYSTEM ERROR] Failed to start process: {str(e)}\n")
+        log_file.close()
+
+def stop_bot(bot_id):
+    """Stops the running bot process."""
+    if bot_id in active_processes:
+        proc_info = active_processes[bot_id]
+        proc = proc_info['proc']
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except:
+            proc.kill()
+        try:
+            proc_info['log_file'].close()
+        except:
+            pass
+        del active_processes[bot_id]
+        print(f"🛑 Bot {bot_id} stopped.")
+
+@atexit.register
+def cleanup_bots():
+    """Ensure all bots stop when the Flask server stops."""
+    for bot_id in list(active_processes.keys()):
+        stop_bot(bot_id)
+
+def startup_running_bots():
+    """Starts bots that were running before the server restarted."""
+    try:
+        print("🔄 Restoring running bots from database...")
+        bots = bots_col.find({"status": "Running"})
+        count = 0
+        for bot in bots:
+            start_bot(str(bot['_id']), bot.get('code', ''))
+            count += 1
+        print(f"✅ Restored {count} running bots.")
+    except Exception as e:
+        print(f"❌ Error restoring bots: {e}")
 
 # ==========================================
 # BACKEND API ROUTES
@@ -126,26 +200,99 @@ def get_bots():
     owner_id = request.args.get('ownerId')
     bots = list(bots_col.find({"ownerId": owner_id}))
     bots = bots[::-1]
+    
+    for bot in bots:
+        bot_id_str = str(bot['_id'])
+        log_path = os.path.join(BOTS_DIR, f"{bot_id_str}.log")
+        
+        # Read the real physical log file
+        file_logs = []
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    file_logs = f.read().splitlines()[-100:] # Last 100 lines for UI
+            except:
+                pass
+        
+        # Merge System Logs from DB with Live Terminal Logs
+        db_logs = bot.get('logs', [])
+        bot['logs'] = db_logs + file_logs
+    
     return jsonify({"success": True, "bots": [serialize_doc(bot) for bot in bots]})
 
 @app.route('/api/bots', methods=['POST'])
 def create_bot():
     bot_data = request.json
     result = bots_col.insert_one(bot_data)
-    bot_data['_id'] = str(result.inserted_id)
+    bot_id = str(result.inserted_id)
+    bot_data['_id'] = bot_id
+    
+    # Start bot immediately if status is Running
+    if bot_data.get('status') == 'Running':
+        start_bot(bot_id, bot_data.get('code', ''))
+        
     return jsonify({"success": True, "bot": bot_data})
 
 @app.route('/api/bots/<bot_id>', methods=['PUT'])
 def update_bot(bot_id):
     update_data = request.json
     if '_id' in update_data: del update_data['_id']
+    
+    # Filter logs to prevent duplicate execution logs saving to database
+    if 'logs' in update_data:
+        update_data['logs'] = [l for l in update_data['logs'] if isinstance(l, str) and l.startswith('[SYSTEM]')]
+    
+    bot = bots_col.find_one({"_id": ObjectId(bot_id)})
+    new_code = update_data.get('code', bot.get('code', ''))
+    
     bots_col.update_one({"_id": ObjectId(bot_id)}, {"$set": update_data})
+    
+    # Control the process based on explicit status updates
+    if 'status' in update_data:
+        if update_data['status'] == 'Running':
+            start_bot(bot_id, new_code)
+        else:
+            stop_bot(bot_id)
+            
     return jsonify({"success": True})
 
 @app.route('/api/bots/<bot_id>', methods=['DELETE'])
 def delete_bot(bot_id):
+    stop_bot(bot_id) # Stop it physically
     bots_col.delete_one({"_id": ObjectId(bot_id)})
+    
+    # Clean up physical files
+    script_path = os.path.join(BOTS_DIR, f"{bot_id}.py")
+    log_path = os.path.join(BOTS_DIR, f"{bot_id}.log")
+    if os.path.exists(script_path): os.remove(script_path)
+    if os.path.exists(log_path): os.remove(log_path)
+    
     return jsonify({"success": True})
+
+@app.route('/api/bots/<bot_id>/install', methods=['POST'])
+def install_package(bot_id):
+    """API for installing python packages via PIP"""
+    pkg = request.json.get('package')
+    if not pkg: 
+        return jsonify({"success": False, "message": "No package specified"})
+    
+    # User types "telebot" but the actual library is "pyTelegramBotAPI"
+    if pkg.lower() == "telebot":
+        pkg = "pyTelegramBotAPI"
+        
+    try:
+        # Run pip install securely and capture output
+        result = subprocess.run([sys.executable, "-m", "pip", "install", pkg], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            # Log to the DB system log
+            bots_col.update_one({"_id": ObjectId(bot_id)}, {"$push": {"logs": f"[SYSTEM] Successfully installed package: {pkg}"}})
+            return jsonify({"success": True, "output": result.stdout})
+        else:
+            return jsonify({"success": False, "message": result.stderr})
+            
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
 
 # --- SUPER ADMIN ROUTES ---
 @app.route('/api/admin/users', methods=['GET'])
@@ -179,7 +326,7 @@ def admin_system_status():
         ],
         "queue": {
             "pending_builds": random.randint(0, 3),
-            "active_workers": 12
+            "active_workers": len(active_processes)
         }
     })
 
@@ -193,10 +340,10 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BotHostBD - Pro Dashboard</title>
+    <title>BotHostBD - Premium Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #0b0f19; }
         .hide-scroll::-webkit-scrollbar { display: none; }
@@ -217,14 +364,26 @@ HTML_CONTENT = """
         
         .gradient-text { background: linear-gradient(to right, #818cf8, #e879f9); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         
-        /* Editor Scrollbar */
-        .editor-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-        .editor-scroll::-webkit-scrollbar-track { background: #050810; }
-        .editor-scroll::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+        /* Premium Editor Scrollbar */
+        .editor-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+        .editor-scroll::-webkit-scrollbar-track { background: transparent; }
+        .editor-scroll::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
         .editor-scroll::-webkit-scrollbar-thumb:hover { background: #334155; }
     </style>
 </head>
 <body class="text-slate-200 font-sans selection:bg-blue-500/30 overflow-hidden">
+
+    <!-- BIG SUCCESS OVERLAY -->
+    <div id="big-success-overlay" class="fixed inset-0 z-[100] flex items-center justify-center bg-[#050810]/80 backdrop-blur-md opacity-0 pointer-events-none transition-all duration-500">
+        <div class="bg-gradient-to-b from-green-900/50 to-slate-900 border border-green-500/50 p-10 rounded-3xl shadow-[0_0_100px_rgba(34,197,94,0.3)] text-center transform scale-75 transition-transform duration-500 max-w-sm w-full" id="big-success-content">
+            <div class="w-24 h-24 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-green-500 shadow-[0_0_30px_rgba(34,197,94,0.5)]">
+                <i data-lucide="check-circle" class="w-12 h-12 text-green-400"></i>
+            </div>
+            <h2 class="text-3xl font-extrabold text-white mb-2">SUCCESS!</h2>
+            <p id="big-success-msg" class="text-green-400 text-sm font-medium">Operation completed successfully.</p>
+            <button onclick="document.getElementById('big-success-overlay').classList.add('opacity-0', 'pointer-events-none'); document.getElementById('big-success-content').classList.replace('scale-100', 'scale-75');" class="mt-8 px-8 py-3 w-full bg-green-600 hover:bg-green-500 text-white rounded-xl font-bold transition-colors shadow-lg">Awesome!</button>
+        </div>
+    </div>
 
     <div class="flex h-screen w-full relative">
         <!-- Sidebar -->
@@ -241,7 +400,7 @@ HTML_CONTENT = """
                     <i data-lucide="layout-grid" class="w-4 h-4"></i> Manage Your Bots
                 </button>
                 <button onclick="window.switchView('create')" id="nav-create" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white">
-                    <i data-lucide="rocket" class="w-4 h-4"></i> Create New Bot
+                    <i data-lucide="rocket" class="w-4 h-4"></i> Deploy New Bot
                 </button>
                 <button onclick="window.switchView('pricing')" id="nav-pricing" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white">
                     <i data-lucide="credit-card" class="w-4 h-4"></i> Plans & Pricing
@@ -276,10 +435,14 @@ HTML_CONTENT = """
         <!-- Main Content -->
         <div class="flex-1 flex flex-col overflow-hidden relative w-full bg-[#0b0f19]">
             <header id="main-header" class="h-16 border-b border-slate-800/80 flex items-center justify-between px-4 md:px-8 bg-[#0f172a]/80 backdrop-blur-md z-10 shrink-0">
-                <h2 id="header-title" class="text-base md:text-lg font-medium text-white">Manage Your Bots</h2>
+                <h2 id="header-title" class="text-base md:text-lg font-medium text-white">Bot Command Center</h2>
                 <div class="flex items-center gap-4">
                     <span id="db-status-badge" class="flex items-center gap-2 text-xs md:text-sm text-green-400 bg-green-500/10 px-3 py-1.5 rounded-full border border-green-500/20">
-                        <i data-lucide="check-circle-2" class="w-3.5 h-3.5"></i> System Online
+                        <span class="relative flex h-2 w-2">
+                          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                          <span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                        </span>
+                        System Online
                     </span>
                     <button class="md:hidden text-slate-400 hover:text-white"><i data-lucide="menu"></i></button>
                 </div>
@@ -287,36 +450,50 @@ HTML_CONTENT = """
 
             <main class="flex-1 overflow-y-auto p-4 md:p-8" id="main-content">
                 
-                <!-- USER DASHBOARD VIEW -->
-                <div id="view-dashboard" class="view-section space-y-6 block">
-                    <div class="mb-6">
-                        <h2 class="text-2xl font-bold text-white mb-2">Full control and customization of your Telegram bots</h2>
-                        <p class="text-sm text-slate-400">View logs, edit code, install packages, and manage instances.</p>
+                <!-- NEW PREMIUM DASHBOARD VIEW (MASTER-DETAIL) -->
+                <div id="view-dashboard" class="view-section space-y-6 block h-full flex flex-col">
+                    
+                    <!-- Header Top Area -->
+                    <div class="flex flex-col md:flex-row justify-between items-start md:items-end shrink-0 gap-4">
+                        <div>
+                            <h2 class="text-2xl md:text-3xl font-extrabold text-white mb-2">Manage Your Bots</h2>
+                            <p class="text-sm text-slate-400">Full control and customization of your Telegram bots.</p>
+                        </div>
+                        <button onclick="window.switchView('create')" class="bg-white text-slate-900 hover:bg-slate-200 px-6 py-2.5 rounded-xl font-bold flex items-center gap-2 transition-all shadow-[0_0_20px_rgba(255,255,255,0.1)]">
+                            <i data-lucide="plus" class="w-5 h-5"></i> Create New Bot
+                        </button>
                     </div>
 
-                    <div>
-                        <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
-                            <h3 class="text-lg font-bold text-white flex items-center gap-2"><i data-lucide="server" class="text-blue-500"></i> Your Bots</h3>
-                            <button onclick="window.switchView('create')" class="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-[0_0_15px_rgba(37,99,235,0.3)]">
-                                <i data-lucide="plus" class="w-4 h-4"></i> Create New Bot
-                            </button>
+                    <!-- Empty State -->
+                    <div id="dashboard-empty-state" class="hidden flex flex-col items-center justify-center flex-1 bg-[#0f172a]/50 border border-slate-800 border-dashed rounded-3xl min-h-[400px]">
+                        <div class="w-20 h-20 bg-slate-800/50 rounded-full flex items-center justify-center mb-6 text-slate-500 shadow-inner">
+                            <i data-lucide="bot" class="w-10 h-10"></i>
                         </div>
+                        <h4 class="text-xl font-bold text-white mb-2">কোনো বট নেই</h4>
+                        <p class="text-sm text-slate-400 mb-8 text-center max-w-sm">নতুন বট তৈরি করে আপনার হোস্টিং যাত্রা শুরু করুন।</p>
+                        <button onclick="window.switchView('create')" class="gradient-btn text-white px-8 py-3 rounded-full font-bold shadow-lg">
+                            Deploy First Bot
+                        </button>
+                    </div>
+
+                    <!-- Layout: Left List & Right Details -->
+                    <div id="dashboard-content" class="flex-1 flex flex-col lg:flex-row gap-6 min-h-0 hidden pb-4">
                         
-                        <div id="empty-state" class="hidden flex flex-col items-center justify-center py-16 bg-[#0f172a]/50 border border-slate-800 border-dashed rounded-2xl">
-                            <div class="w-16 h-16 bg-slate-800/50 rounded-full flex items-center justify-center mb-4 text-slate-500">
-                                <i data-lucide="bot" class="w-8 h-8"></i>
-                            </div>
-                            <h4 class="text-lg font-medium text-white mb-2">কোনো বট নেই</h4>
-                            <p class="text-sm text-slate-400 mb-6 text-center max-w-sm">নতুন বট তৈরি করে আপনার হোস্টিং শুরু করুন।</p>
+                        <!-- LEFT COLUMN: Bot List -->
+                        <div class="w-full lg:w-1/3 flex flex-col gap-3 overflow-y-auto editor-scroll pr-1" id="dashboard-bot-list">
+                            <!-- Populated by JS -->
                         </div>
 
-                        <div class="grid grid-cols-1 xl:grid-cols-2 gap-6" id="bot-list-container"></div>
+                        <!-- RIGHT COLUMN: Selected Bot Details -->
+                        <div class="w-full lg:w-2/3 bg-[#0f172a] border border-slate-800 rounded-3xl p-6 md:p-8 shadow-2xl flex flex-col overflow-y-auto editor-scroll relative" id="dashboard-bot-details">
+                            <!-- Populated by JS -->
+                        </div>
+
                     </div>
                 </div>
 
                 <!-- CREATE BOT WIZARD VIEW -->
                 <div id="view-create" class="view-section hidden max-w-4xl mx-auto py-4">
-                    
                     <!-- Header -->
                     <div class="text-center mb-12">
                         <h2 class="text-4xl font-extrabold text-white mb-3">Create Your Bot <span class="text-2xl">🚀</span></h2>
@@ -326,7 +503,6 @@ HTML_CONTENT = """
                     <!-- Stepper -->
                     <div class="relative flex justify-between items-center max-w-2xl mx-auto mb-12 px-2">
                         <div class="step-line"></div>
-                        
                         <div class="flex flex-col items-center gap-2 z-10 w-16">
                             <div id="step-indicator-1" class="step-circle step-active">1</div>
                             <span id="step-text-1" class="text-xs font-bold text-white">Platform</span>
@@ -521,7 +697,7 @@ HTML_CONTENT = """
                                     <div class="flex gap-2">
                                         <button onclick="showToast('Auto-scroll toggled')" class="text-slate-400 hover:text-white transition-colors" title="Auto-scroll"><i data-lucide="arrow-down-circle" class="w-4 h-4"></i></button>
                                         <button onclick="showToast('Errors copied to clipboard')" class="text-slate-400 hover:text-white transition-colors" title="Copy Errors"><i data-lucide="copy" class="w-4 h-4"></i></button>
-                                        <button onclick="showToast('Logs Refreshed')" class="text-slate-400 hover:text-white transition-colors" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                                        <button onclick="window.openEditor(window.selectedBotId); showToast('Logs Refreshed')" class="text-slate-400 hover:text-white transition-colors" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
                                         <button onclick="document.getElementById('editor-logs-container').innerHTML='<div class=\'text-center text-slate-600 mt-4\'>Logs cleared.</div>'" class="text-slate-400 hover:text-red-400 transition-colors" title="Clear Logs"><i data-lucide="trash" class="w-4 h-4"></i></button>
                                         <button onclick="window.switchView('logs')" class="text-blue-400 hover:text-blue-300 text-[10px] font-bold px-2 py-0.5 border border-blue-500/30 rounded bg-blue-500/10 uppercase tracking-wide">All Logs</button>
                                     </div>
@@ -537,8 +713,8 @@ HTML_CONTENT = """
                                     </div>
                                 </div>
                                 <div class="px-4 py-2 border-t border-slate-800 text-[10px] text-slate-500 flex justify-between bg-[#1e293b]/30 font-medium">
-                                    <span>200 lines loaded</span>
-                                    <span>Error logs only • Updates every 5 seconds</span>
+                                    <span>Live terminal output included</span>
+                                    <span>Updates on save/refresh</span>
                                 </div>
                             </div>
                         </div>
@@ -642,6 +818,7 @@ HTML_CONTENT = """
                     </div>
                     <div id="log-scroll-area" class="flex-1 bg-[#050810] border border-slate-800 rounded-2xl font-mono text-xs md:text-sm p-5 overflow-y-auto relative shadow-inner min-h-[400px]">
                         <div class="sticky top-0 right-0 flex justify-end pb-2 mb-3 border-b border-slate-800/80 bg-[#050810]/90 backdrop-blur z-10">
+                            <button onclick="window.openLogs(window.selectedBotId)" class="mr-2 text-xs text-blue-400 hover:text-white flex items-center gap-1"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i> Refresh</button>
                             <span class="text-xs text-slate-500 flex items-center gap-1.5"><i data-lucide="terminal" class="w-3.5 h-3.5"></i> Live Server Logs</span>
                         </div>
                         <div id="log-container" class="space-y-1.5 pb-4 leading-relaxed"></div>
@@ -687,6 +864,7 @@ HTML_CONTENT = """
         let myBots = [];
         let isSignupMode = false;
         let adminData = { users: [], bots: [], system: {} };
+        let activeDashboardBotId = null; // New state for premium layout
         
         // Wizard State
         let wizardData = { token: '', botName: '', botUsername: '' };
@@ -710,6 +888,23 @@ HTML_CONTENT = """
             document.body.appendChild(toast);
             lucide.createIcons();
             setTimeout(() => { toast.classList.add('opacity-0', 'translate-x-8'); setTimeout(() => toast.remove(), 300); }, 3000);
+        }
+
+        // BIG SUCCESS OVERLAY FUNCTION
+        function showBigSuccess(msg) {
+            const overlay = document.getElementById('big-success-overlay');
+            const content = document.getElementById('big-success-content');
+            document.getElementById('big-success-msg').innerText = msg;
+            
+            overlay.classList.remove('opacity-0', 'pointer-events-none');
+            content.classList.replace('scale-75', 'scale-100');
+            lucide.createIcons();
+            
+            // Auto close after 5 seconds
+            setTimeout(() => {
+                overlay.classList.add('opacity-0', 'pointer-events-none');
+                content.classList.replace('scale-100', 'scale-75');
+            }, 5000);
         }
 
         // ---------------- AUTH ----------------
@@ -760,7 +955,7 @@ HTML_CONTENT = """
 
         window.handleLogout = () => {
             localStorage.removeItem('botHostUser');
-            currentUser = null; myBots = [];
+            currentUser = null; myBots = []; activeDashboardBotId = null;
             window.switchView('dashboard');
             showModal();
         }
@@ -793,15 +988,276 @@ HTML_CONTENT = """
                 mainHeader.classList.remove('hidden');
             }
 
-            const titles = { 'dashboard': 'Manage Your Bots', 'create': 'Create New Bot', 'logs': 'Server Logs', 'superadmin': 'Super Admin Core', 'pricing': 'Upgrade Plan' };
+            const titles = { 'dashboard': 'Bot Command Center', 'create': 'Create New Bot', 'logs': 'Server Logs', 'superadmin': 'Super Admin Core', 'pricing': 'Upgrade Plan' };
             if(titles[viewName]) document.getElementById('header-title').innerText = titles[viewName];
 
             document.querySelectorAll('.nav-btn').forEach(btn => {
                 btn.className = "nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white";
             });
-            const activeBtn = document.getElementById('nav-' + (viewName === 'editor' ? 'dashboard' : viewName));
+            const activeBtn = document.getElementById('nav-' + (viewName === 'editor' || viewName === 'logs' ? 'dashboard' : viewName));
             if(activeBtn) activeBtn.className = "nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600/10 text-blue-500";
         }
+
+        // ---------------- NEW DASHBOARD RENDER LOGIC (PREMIUM MASTER-DETAIL) ----------------
+        async function fetchBotsFromMongo(userId) {
+            try {
+                const response = await fetch('/api/bots?ownerId=' + userId);
+                const data = await response.json();
+                if(data.success) { 
+                    myBots = data.bots; 
+                    renderDashboard(); 
+                }
+            } catch(e) {}
+        }
+
+        function renderDashboard() {
+            const emptyState = document.getElementById('dashboard-empty-state');
+            const contentArea = document.getElementById('dashboard-content');
+            const listContainer = document.getElementById('dashboard-bot-list');
+
+            if(myBots.length === 0) {
+                emptyState.classList.remove('hidden');
+                contentArea.classList.add('hidden');
+                return;
+            }
+
+            emptyState.classList.add('hidden');
+            contentArea.classList.remove('hidden');
+
+            // Select first bot if none selected or selected bot was deleted
+            if (!activeDashboardBotId || !myBots.find(b => b._id === activeDashboardBotId)) {
+                activeDashboardBotId = myBots[0]._id;
+            }
+
+            // Render Left Sidebar List
+            listContainer.innerHTML = myBots.map(bot => {
+                const isActive = bot._id === activeDashboardBotId;
+                const isRunning = bot.status === 'Running';
+                return `
+                    <div onclick="window.selectDashboardBot('${bot._id}')" class="cursor-pointer transition-all duration-300 p-4 rounded-2xl border ${isActive ? 'bg-blue-600/10 border-blue-500 shadow-[0_0_20px_rgba(37,99,235,0.15)]' : 'bg-[#0f172a] border-slate-800 hover:border-slate-600 hover:bg-slate-800/50'} flex items-center justify-between group">
+                        <div class="flex items-center gap-4">
+                            <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0 ${isRunning ? 'bg-blue-500/20 text-blue-400' : 'bg-slate-800 text-slate-400'}">
+                                <i data-lucide="bot" class="w-6 h-6"></i>
+                            </div>
+                            <div class="overflow-hidden">
+                                <h4 class="text-base font-bold text-white mb-0.5 truncate group-hover:text-blue-400 transition-colors">${bot.name}</h4>
+                                <div class="flex items-center gap-2">
+                                    <span class="flex items-center gap-1.5 text-[11px] uppercase tracking-wider font-bold ${isRunning ? 'text-green-400' : 'text-slate-500'}">
+                                        <span class="w-2 h-2 rounded-full ${isRunning ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}"></span>
+                                        ${bot.status}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        <i data-lucide="chevron-right" class="w-5 h-5 shrink-0 ${isActive ? 'text-blue-500' : 'text-slate-600 group-hover:text-slate-400'}"></i>
+                    </div>
+                `;
+            }).join('');
+
+            // Render Right Details Panel
+            renderBotDetails();
+            lucide.createIcons();
+        }
+
+        window.selectDashboardBot = (id) => {
+            activeDashboardBotId = id;
+            renderDashboard(); 
+        }
+
+        function renderBotDetails() {
+            const container = document.getElementById('dashboard-bot-details');
+            const bot = myBots.find(b => b._id === activeDashboardBotId);
+            if(!bot) return;
+
+            const isRunning = bot.status === 'Running';
+
+            container.innerHTML = `
+                <!-- Top Bot Identity -->
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-slate-800/80 pb-6 mb-8 gap-4">
+                    <div class="flex items-center gap-5">
+                        <div class="w-16 h-16 shrink-0 rounded-2xl bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700 flex items-center justify-center relative shadow-lg">
+                            ${isRunning ? '<div class="absolute -top-1 -right-1 w-4 h-4 bg-green-500 rounded-full border-2 border-[#0f172a] animate-pulse"></div>' : '<div class="absolute -top-1 -right-1 w-4 h-4 bg-slate-500 rounded-full border-2 border-[#0f172a]"></div>'}
+                            <i data-lucide="bot" class="w-8 h-8 text-white"></i>
+                        </div>
+                        <div class="overflow-hidden">
+                            <h2 class="text-3xl font-black text-white tracking-tight mb-1 truncate">${bot.name}</h2>
+                            <p class="text-sm text-blue-400 font-medium truncate">@${bot.bot_username || 'unknown_bot'}</p>
+                        </div>
+                    </div>
+                    <div class="flex gap-4 shrink-0">
+                         <div class="bg-[#050810] px-4 py-2 rounded-xl border border-slate-800 flex flex-col items-end">
+                             <span class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">CPU Usage</span>
+                             <span class="text-sm font-mono font-bold ${isRunning ? 'text-green-400' : 'text-slate-500'}">${bot.cpuUsage || '0%'}</span>
+                         </div>
+                         <div class="bg-[#050810] px-4 py-2 rounded-xl border border-slate-800 flex flex-col items-end">
+                             <span class="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-0.5">RAM Usage</span>
+                             <span class="text-sm font-mono font-bold ${isRunning ? 'text-yellow-400' : 'text-slate-500'}">${bot.ramUsage || '0MB'}</span>
+                         </div>
+                    </div>
+                </div>
+
+                <!-- Action Button Grid -->
+                <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2"><i data-lucide="zap" class="w-4 h-4 text-amber-400"></i> Core Actions</h3>
+                <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3 mb-10">
+                    
+                    <!-- Start/Stop/Kill Button -->
+                    <button onclick="window.toggleBot('${bot._id}')" class="group relative overflow-hidden rounded-2xl p-4 bg-gradient-to-b ${isRunning ? 'from-red-500/10 to-red-900/10 border-red-500/30 hover:border-red-500 text-red-400 hover:shadow-[0_0_20px_rgba(239,68,68,0.2)]' : 'from-green-500/10 to-green-900/10 border-green-500/30 hover:border-green-500 text-green-400 hover:shadow-[0_0_20px_rgba(34,197,94,0.2)]'} border transition-all flex flex-col items-center justify-center gap-2 lg:col-span-2">
+                        <i data-lucide="${isRunning ? 'power' : 'play'}" class="w-8 h-8 transition-transform group-hover:scale-110"></i>
+                        <span class="text-sm font-bold">${isRunning ? 'Stop Server' : 'Start Server'}</span>
+                    </button>
+
+                    <!-- Restart Button -->
+                    <button onclick="window.restartBot('${bot._id}')" class="group relative overflow-hidden rounded-2xl p-4 bg-gradient-to-b from-blue-500/10 to-blue-900/10 border border-blue-500/30 hover:border-blue-500 text-blue-400 transition-all hover:shadow-[0_0_20px_rgba(59,130,246,0.2)] flex flex-col items-center justify-center gap-2" ${!isRunning ? 'disabled style="opacity:0.4; cursor:not-allowed;"' : ''}>
+                        <i data-lucide="refresh-cw" class="w-8 h-8 transition-transform group-hover:rotate-180"></i>
+                        <span class="text-sm font-bold">Restart</span>
+                    </button>
+
+                    <!-- Editor Button -->
+                    <button onclick="window.openEditor('${bot._id}')" class="group relative overflow-hidden rounded-2xl p-4 bg-gradient-to-b from-purple-500/10 to-purple-900/10 border border-purple-500/30 hover:border-purple-500 text-purple-400 transition-all hover:shadow-[0_0_20px_rgba(168,85,247,0.2)] flex flex-col items-center justify-center gap-2">
+                        <i data-lucide="code-2" class="w-8 h-8 transition-transform group-hover:scale-110"></i>
+                        <span class="text-sm font-bold">Editor</span>
+                    </button>
+
+                    <!-- Logs Button -->
+                    <button onclick="window.openLogs('${bot._id}')" class="group relative overflow-hidden rounded-2xl p-4 bg-gradient-to-b from-slate-500/10 to-slate-800/30 border border-slate-600 hover:border-slate-400 text-slate-300 transition-all hover:shadow-lg flex flex-col items-center justify-center gap-2">
+                        <i data-lucide="terminal-square" class="w-8 h-8 transition-transform group-hover:scale-110"></i>
+                        <span class="text-sm font-bold">Logs</span>
+                    </button>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-8">
+                    <!-- Dependencies Section -->
+                    <div class="bg-[#050810] border border-slate-800 rounded-2xl p-6 flex flex-col">
+                        <h3 class="text-lg font-bold text-white mb-1 flex items-center gap-2"><i data-lucide="package-plus" class="w-5 h-5 text-indigo-400"></i> Dependencies</h3>
+                        <p class="text-xs text-slate-500 mb-5">Install python packages directly via pip.</p>
+                        
+                        <div class="mt-auto space-y-3">
+                            <input type="text" id="pkg-${bot._id}" placeholder="e.g. aiogram==3.2.0" class="w-full bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-3.5 text-sm text-white focus:outline-none focus:border-indigo-500 transition-colors">
+                            <button onclick="window.installPackage('${bot._id}')" class="w-full py-3.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl shadow-[0_0_20px_rgba(79,70,229,0.3)] transition-all flex justify-center items-center gap-2">
+                                Install Package <i data-lucide="arrow-right" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- File Manager / Requirements Section -->
+                    <div class="bg-[#050810] border border-slate-800 rounded-2xl p-6 flex flex-col justify-between relative overflow-hidden">
+                        <!-- Decorative bg -->
+                        <div class="absolute -right-10 -bottom-10 opacity-5 pointer-events-none"><i data-lucide="folder" class="w-48 h-48"></i></div>
+                        
+                        <div>
+                            <h3 class="text-lg font-bold text-white mb-1 flex items-center gap-2"><i data-lucide="folder-kanban" class="w-5 h-5 text-amber-400"></i> File Management</h3>
+                            <p class="text-xs text-slate-500 mb-5">Upload requirements.txt or other assets.</p>
+                        </div>
+                        <div class="space-y-3 mt-auto relative z-10">
+                            <div class="border border-slate-700 bg-[#0f172a] rounded-xl flex items-center p-2 gap-2">
+                                <button class="px-4 py-2 bg-slate-800 rounded-lg text-xs font-bold text-slate-300 shrink-0">Choose File</button>
+                                <span class="text-xs text-slate-500 truncate">No file chosen</span>
+                            </div>
+                            <button onclick="showToast('File manager coming soon!')" class="w-full py-3.5 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl border border-slate-600 transition-all flex justify-center items-center gap-2 shadow-lg">
+                                Open File Manager
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Danger Zone Bottom -->
+                <div class="mt-auto pt-6 border-t border-slate-800/80 flex flex-wrap justify-between items-center gap-4">
+                    <div class="bg-slate-900 px-3 py-1.5 rounded-md border border-slate-800 flex items-center gap-2">
+                        <i data-lucide="fingerprint" class="w-4 h-4 text-slate-500"></i>
+                        <span class="text-[10px] font-mono text-slate-400 uppercase tracking-widest">${bot._id}</span>
+                    </div>
+                    <button onclick="window.deleteBot('${bot._id}')" class="text-xs font-bold text-red-500 hover:text-white bg-red-500/10 hover:bg-red-600 px-5 py-2.5 rounded-xl transition-all border border-red-500/20 hover:border-red-600 hover:shadow-[0_0_15px_rgba(239,68,68,0.4)] flex items-center gap-2">
+                        <i data-lucide="trash-2" class="w-4 h-4"></i> Delete Bot Instance
+                    </button>
+                </div>
+            `;
+        }
+
+        // Toggle Bot Status
+        window.toggleBot = async (id) => {
+            const bot = myBots.find(b => b._id === id);
+            if(!bot) return;
+            const isRunning = bot.status === 'Running';
+            bot.status = isRunning ? 'Stopped' : 'Running';
+            
+            // Re-render dashboard instantly to show loading/change
+            renderDashboard(); 
+            
+            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: bot.status}) });
+            await fetchBotsFromMongo(currentUser._id); // Fetch fresh data
+        }
+
+        // Restart Bot 
+        window.restartBot = async (id) => {
+            const bot = myBots.find(b => b._id === id);
+            if(!bot || bot.status !== 'Running') return;
+            
+            showToast('Restarting server... Please wait.');
+            bot.status = 'Stopped';
+            renderDashboard();
+            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Stopped'}) });
+            
+            setTimeout(async () => {
+                bot.status = 'Running';
+                renderDashboard();
+                await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Running'}) });
+                showToast('Bot Restarted Successfully!');
+                await fetchBotsFromMongo(currentUser._id);
+            }, 1500);
+        }
+
+        // Delete Bot
+        window.deleteBot = async (id) => {
+            if(!confirm("Are you sure you want to permanently delete this bot?")) return;
+            
+            // If deleting the active bot, reset the selection
+            if(activeDashboardBotId === id) {
+                activeDashboardBotId = null;
+            }
+
+            myBots = myBots.filter(b => b._id !== id); 
+            renderDashboard();
+            
+            await fetch('/api/bots/' + id, { method: 'DELETE' });
+            fetchBotsFromMongo(currentUser._id);
+        }
+
+
+        // ---------------- PACKAGE INSTALL LOGIC ----------------
+        window.installPackage = async (botId) => {
+            const pkgInput = document.getElementById(`pkg-${botId}`);
+            if(!pkgInput) return;
+            const pkg = pkgInput.value.trim();
+            if(!pkg) return showToast("Please enter a package name", true);
+            
+            const btn = pkgInput.nextElementSibling;
+            const origHtml = btn.innerHTML;
+            btn.innerHTML = `<i data-lucide="loader" class="w-5 h-5 animate-spin"></i>`;
+            btn.disabled = true;
+            lucide.createIcons();
+
+            showToast(`Installing ${pkg}. This might take a few seconds...`);
+            try {
+                const res = await fetch(`/api/bots/${botId}/install`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({package: pkg})
+                });
+                const data = await res.json();
+                if(data.success) {
+                    showBigSuccess(`${pkg} has been installed successfully!`);
+                    pkgInput.value = '';
+                } else {
+                    showToast(`Failed: ${data.message}`, true);
+                }
+            } catch(e) {
+                showToast("Install error! Check your connection.", true);
+            } finally {
+                btn.innerHTML = origHtml;
+                btn.disabled = false;
+                lucide.createIcons();
+            }
+        };
 
         // ---------------- EDITOR LOGIC ----------------
         window.openEditor = (id) => {
@@ -811,10 +1267,8 @@ HTML_CONTENT = """
 
             document.getElementById('editor-bot-name').innerText = bot.name;
             
-            const defaultCode = `import telebot\n\nbot = telebot.TeleBot('${bot.token || 'YOUR_BOT_TOKEN'}')\n\n@bot.message_handler(commands=['start', 'help'])\ndef send_welcome(message):\n    bot.reply_to(message, "Hello! I am " + bot.get_me().first_name)\n\n@bot.message_handler(func=lambda m: True)\ndef echo_all(message):\n    bot.reply_to(message, message.text)\n\nbot.infinity_polling()`;
-            
             const textArea = document.getElementById('editor-textarea');
-            textArea.value = bot.code || defaultCode;
+            textArea.value = bot.code || '';
             
             const updateLineCount = () => {
                 const lines = textArea.value.split('\\n').length;
@@ -828,17 +1282,16 @@ HTML_CONTENT = """
             if(bot.logs && bot.logs.length > 0) {
                 logsContainer.innerHTML = bot.logs.slice(-50).map(log => {
                     let color = "text-slate-400";
-                    if(log.includes('[ERROR]')) color = "text-red-400";
+                    if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error') || log.includes('ModuleNotFoundError')) color = "text-red-400";
                     if(log.includes('[SUCCESS]')) color = "text-green-400";
                     if(log.includes('[SYSTEM]')) color = "text-blue-400";
                     return `<div class="${color} break-words py-0.5">${log}</div>`;
                 }).join('');
             } else {
-                logsContainer.innerHTML = `<div class="text-center text-slate-600 mt-8"><i data-lucide="coffee" class="w-8 h-8 mx-auto mb-2 opacity-50"></i>No errors logs available yet<br>Start your bot to see logs here</div>`;
+                logsContainer.innerHTML = `<div class="text-center text-slate-600 mt-8"><i data-lucide="coffee" class="w-8 h-8 mx-auto mb-2 opacity-50"></i>No logs available yet</div>`;
             }
 
             window.switchView('editor');
-            showToast(`Successfully loaded ${bot.name}!`);
             lucide.createIcons();
             
             setTimeout(() => { logsContainer.scrollTop = logsContainer.scrollHeight; }, 100);
@@ -856,17 +1309,16 @@ HTML_CONTENT = """
             lucide.createIcons();
 
             const updates = { code: code };
+            
             if(!bot.logs) bot.logs = [];
             
             if (restart) {
                 updates.status = 'Running';
                 bot.logs.push('[SYSTEM] Code updated. Rebuilding and restarting server...');
-                updates.cpuUsage = '15%';
-                updates.ramUsage = '130MB / 512MB';
             } else {
                 bot.logs.push('[SYSTEM] Code saved successfully. (Not restarted)');
             }
-            updates.logs = bot.logs;
+            updates.logs = bot.logs; // Pass it, the backend will filter properly
 
             try {
                 const response = await fetch('/api/bots/' + bot._id, {
@@ -878,13 +1330,9 @@ HTML_CONTENT = """
                 
                 if(data.success) {
                     bot.code = code;
-                    if(restart) {
-                        bot.status = 'Running';
-                        bot.cpuUsage = updates.cpuUsage;
-                        bot.ramUsage = updates.ramUsage;
-                    }
+                    if(restart) bot.status = 'Running';
                     showToast(restart ? "Saved and Restarted successfully!" : "Code saved.");
-                    renderDashboard(); // Update background data
+                    await fetchBotsFromMongo(currentUser._id); // Refresh data and file logs
                 }
             } catch (err) {
                 showToast("Failed to save code.", true);
@@ -975,6 +1423,9 @@ HTML_CONTENT = """
             btn.disabled = true; btn.innerHTML = `<i data-lucide="loader" class="w-5 h-5 animate-spin"></i> Deploying...`;
             lucide.createIcons();
 
+            // Setup default code so bot runs instantly
+            const defaultCode = `import telebot\nimport time\nfrom telebot import apihelper\n\n# ==========================================================\n# 🛑 NETWORK TIMEOUT FIX (For Bangladesh/Restricted Networks)\n# If your bot shows "ConnectTimeoutError" or "timed out", \n# uncomment the line below and add a free proxy address:\n# ==========================================================\n# apihelper.proxy = {'https': 'http://161.35.197.114:8080'}\n\nbot = telebot.TeleBot('${wizardData.token}')\n\n@bot.message_handler(commands=['start', 'help'])\ndef send_welcome(message):\n    bot.reply_to(message, "Hello! I am alive and hosted on BotHostBD!")\n\n@bot.message_handler(func=lambda m: True)\ndef echo_all(message):\n    bot.reply_to(message, message.text)\n\nprint("Bot is starting...")\nbot.infinity_polling()`;
+
             const newBot = {
                 name: wizardData.botName,
                 bot_username: wizardData.botUsername,
@@ -985,7 +1436,8 @@ HTML_CONTENT = """
                 cpuUsage: '5%',
                 uptime: '0m',
                 ownerId: currentUser._id,
-                logs: ["[SYSTEM] Project created via Template."]
+                code: defaultCode,
+                logs: ["[SYSTEM] Project created via Template and Code applied."]
             };
 
             try {
@@ -999,9 +1451,10 @@ HTML_CONTENT = """
                 if(data.success) {
                     document.getElementById('wizard-token').value = '';
                     myBots.unshift(data.bot);
+                    activeDashboardBotId = data.bot._id; // select the newly created bot
                     window.switchView('dashboard');
                     renderDashboard();
-                    showToast("🚀 Deployment Successful!");
+                    showBigSuccess("Deployment Successful! Bot is Running.");
                 }
             } catch(e) { showToast("Deployment failed.", true); }
             finally {
@@ -1009,92 +1462,34 @@ HTML_CONTENT = """
             }
         }
 
-        // ---------------- DASHBOARD RENDER ----------------
-        async function fetchBotsFromMongo(userId) {
-            try {
-                const response = await fetch('/api/bots?ownerId=' + userId);
-                const data = await response.json();
-                if(data.success) { myBots = data.bots; renderDashboard(); }
-            } catch(e) {}
-        }
-
-        function renderDashboard() {
-            const container = document.getElementById('bot-list-container');
-            if(myBots.length === 0) {
-                container.innerHTML = '';
-                document.getElementById('empty-state').classList.remove('hidden');
-                return;
-            }
-            document.getElementById('empty-state').classList.add('hidden');
-
-            container.innerHTML = myBots.map(bot => {
-                const isRunning = bot.status === 'Running';
-                return `
-                <div class="bg-[#0f172a] border border-slate-800 rounded-2xl p-6 shadow-lg relative overflow-hidden group">
-                    ${isRunning ? '<div class="absolute top-0 left-0 w-1 h-full bg-blue-500 shadow-[0_0_15px_rgba(37,99,235,1)]"></div>' : ''}
-                    
-                    <div class="flex justify-between items-start border-b border-slate-800 pb-4 mb-4">
-                        <div>
-                            <h4 class="text-xl font-bold text-white mb-1 truncate">${bot.name}</h4>
-                            <p class="text-sm font-medium text-blue-400">@${bot.bot_username || 'unknown'}</p>
-                        </div>
-                        <span class="px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${isRunning ? 'text-blue-400 border-blue-500/30 bg-blue-500/10' : 'text-slate-400 border-slate-700 bg-slate-800'}">
-                            ${isRunning ? '<span class="inline-block w-2 h-2 rounded-full bg-current animate-pulse mr-1"></span>' : ''} ${bot.status}
-                        </span>
-                    </div>
-
-                    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-                        <button onclick="window.toggleBot('${bot._id}')" class="py-2.5 rounded-xl text-xs font-bold transition-all border ${isRunning ? 'border-slate-700 text-slate-300 hover:bg-slate-800' : 'bg-blue-600 border-blue-600 text-white hover:bg-blue-500 shadow-[0_0_10px_rgba(37,99,235,0.3)]'} flex items-center justify-center gap-1.5">
-                            <i data-lucide="${isRunning ? 'square' : 'play'}" class="w-4 h-4"></i> ${isRunning ? 'Stop' : 'Start'}
-                        </button>
-                        <button onclick="showToast('Files coming soon')" class="py-2.5 rounded-xl bg-slate-800/50 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700 text-xs font-bold transition-colors flex items-center justify-center gap-1.5"><i data-lucide="folder" class="w-4 h-4"></i> Files</button>
-                        <button onclick="window.openEditor('${bot._id}')" class="py-2.5 rounded-xl bg-slate-800/50 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700 text-xs font-bold transition-colors flex items-center justify-center gap-1.5"><i data-lucide="code" class="w-4 h-4"></i> Editor</button>
-                        <button onclick="window.openLogs('${bot._id}')" class="py-2.5 rounded-xl bg-slate-800/50 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-700 text-xs font-bold transition-colors flex items-center justify-center gap-1.5"><i data-lucide="terminal" class="w-4 h-4"></i> Logs</button>
-                        <button onclick="window.deleteBot('${bot._id}')" class="py-2.5 rounded-xl border border-red-500/20 text-red-400 hover:bg-red-500/10 text-xs font-bold transition-colors flex items-center justify-center gap-1.5"><i data-lucide="trash-2" class="w-4 h-4"></i> Delete</button>
-                    </div>
-
-                    <div class="bg-[#050810] p-5 rounded-2xl border border-slate-800/80">
-                        <h4 class="text-sm font-bold text-white mb-3 flex items-center gap-2"><i data-lucide="package" class="w-4 h-4 text-purple-400"></i> Dependencies</h4>
-                        <div class="flex flex-col md:flex-row gap-3 mb-2">
-                            <input type="text" id="pkg-${bot._id}" placeholder="e.g. pyTelegramBotAPI" class="flex-1 bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-purple-500">
-                            <button onclick="showToast('Installing package...')" class="px-6 py-2.5 bg-purple-600 hover:bg-purple-500 text-white text-sm font-bold rounded-xl shadow-[0_0_15px_rgba(147,51,234,0.3)] transition-colors">Install</button>
-                        </div>
-                    </div>
-                </div>`;
-            }).join('');
-            lucide.createIcons();
-        }
-
-        window.deleteBot = async (id) => {
-            if(!confirm("Delete this bot permanently?")) return;
-            myBots = myBots.filter(b => b._id !== id); renderDashboard();
-            await fetch('/api/bots/' + id, { method: 'DELETE' });
-            fetchBotsFromMongo(currentUser._id);
-        }
-
-        window.toggleBot = async (id) => {
+        window.openLogs = async (id) => {
+            await fetchBotsFromMongo(currentUser._id); // Fetch fresh logs before opening
+            window.selectedBotId = id; 
             const bot = myBots.find(b => b._id === id);
-            if(!bot) return;
-            const isRunning = bot.status === 'Running';
-            bot.status = isRunning ? 'Stopped' : 'Running';
-            renderDashboard();
-            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: bot.status}) });
-        }
-
-        window.openLogs = (id) => {
-            window.selectedBotId = id; const bot = myBots.find(b => b._id === id);
             if(!bot) return;
             document.getElementById('log-bot-name').innerText = bot.name;
             document.getElementById('log-bot-status').innerText = bot.status;
-            document.getElementById('log-container').innerHTML = (bot.logs||[]).map((log, i) => `<div class="flex px-2 py-0.5"><span class="text-slate-600 w-8 pr-3">${i+1}</span><span class="text-slate-300">${log}</span></div>`).join('');
+            
+            const logsContainer = document.getElementById('log-container');
+            if (bot.logs && bot.logs.length > 0) {
+                logsContainer.innerHTML = bot.logs.map((log, i) => {
+                    let color = "text-slate-300";
+                    if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error')) color = "text-red-400 font-bold";
+                    if(log.includes('[SYSTEM]')) color = "text-blue-400";
+                    return `<div class="flex px-2 py-0.5 hover:bg-slate-800/30 rounded"><span class="text-slate-600 w-8 pr-3 shrink-0">${i+1}</span><span class="${color} break-words">${log}</span></div>`;
+                }).join('');
+            } else {
+                logsContainer.innerHTML = "<div class='text-center text-slate-500 py-10'>No logs available. Start the bot first!</div>";
+            }
             window.switchView('logs');
+            setTimeout(() => { document.getElementById('log-scroll-area').scrollTop = document.getElementById('log-scroll-area').scrollHeight; }, 100);
         }
 
-        // PRICING TAB & ADMIN TAB (Keeping functionality intact)
-        window.switchBilling = (cycle) => { /* implementation */ }
-        window.upgradePlan = async (planName) => { /* implementation */ }
-        window.switchAdminTab = (tab) => { /* implementation */ }
-        window.loadAdminData = async () => { /* implementation */ }
+        // PRICING TAB & ADMIN TAB
+        window.switchBilling = (cycle) => { /* implementation placeholder */ }
+        window.upgradePlan = async (planName) => { /* implementation placeholder */ }
+        window.switchAdminTab = (tab) => { /* implementation placeholder */ }
+        window.loadAdminData = async () => { /* implementation placeholder */ }
         
         function showModal() { document.getElementById('login-modal').classList.remove('opacity-0', 'pointer-events-none'); }
         function hideModal() { document.getElementById('login-modal').classList.add('opacity-0', 'pointer-events-none'); }
@@ -1109,5 +1504,6 @@ def home():
     return HTML_CONTENT
 
 if __name__ == '__main__':
-    print("🚀 Starting BotHost Real Backend...")
+    print("🚀 Starting Premium BotHost Backend...")
+    startup_running_bots()  # Restore any previously running bots on server start!
     app.run(debug=True, port=5000)
