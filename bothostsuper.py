@@ -63,7 +63,7 @@ def start_bot(bot_id, code):
         print(f"✅ Bot {bot_id} started successfully. PID: {proc.pid}")
     except Exception as e:
         print(f"❌ Failed to start bot {bot_id}: {e}")
-        log_file.write(f"\n[SYSTEM ERROR] Failed to start process: {str(e)}\n")
+        log_file.write(f"\n[SYSTEM] ❌ CRITICAL ERROR: Failed to launch process. Details: {str(e)}\n")
         log_file.close()
 
 def stop_bot(bot_id):
@@ -286,7 +286,7 @@ def install_package(bot_id):
         
         if result.returncode == 0:
             # Log to the DB system log
-            bots_col.update_one({"_id": ObjectId(bot_id)}, {"$push": {"logs": f"[SYSTEM] Successfully installed package: {pkg}"}})
+            bots_col.update_one({"_id": ObjectId(bot_id)}, {"$push": {"logs": f"[SYSTEM] 📦 Package installation successful: {pkg}"}})
             return jsonify({"success": True, "output": result.stdout})
         else:
             return jsonify({"success": False, "message": result.stderr})
@@ -343,7 +343,7 @@ HTML_CONTENT = """
     <title>BotHostBD - Premium Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #0b0f19; }
         .hide-scroll::-webkit-scrollbar { display: none; }
@@ -386,47 +386,55 @@ HTML_CONTENT = """
     </div>
 
     <div class="flex h-screen w-full relative">
-        <!-- Sidebar -->
-        <div class="w-64 bg-[#0f172a] border-r border-slate-800 flex flex-col hidden md:flex shrink-0 z-20 shadow-xl">
-            <div class="p-6 flex items-center gap-3 border-b border-slate-800/50">
-                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(37,99,235,0.4)]">
-                    <i data-lucide="bot" class="text-white w-5 h-5"></i>
+        <!-- Sidebar (Wider & More Premium) -->
+        <div class="w-72 bg-gradient-to-b from-[#0f172a] to-[#0b0f19] border-r border-slate-800/80 flex flex-col hidden md:flex shrink-0 z-20 shadow-[4px_0_24px_rgba(0,0,0,0.4)]">
+            
+            <!-- Premium Logo Section -->
+            <div class="p-6 md:p-8 flex items-center gap-4 border-b border-slate-800/80 relative overflow-hidden">
+                <div class="absolute top-1/2 left-10 -translate-y-1/2 w-20 h-20 bg-blue-500/20 blur-3xl rounded-full pointer-events-none"></div>
+                <div class="w-12 h-12 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(79,70,229,0.4)] relative z-10 shrink-0">
+                    <i data-lucide="bot" class="text-white w-7 h-7"></i>
                 </div>
-                <h1 class="text-xl font-bold text-white tracking-wide">BotHost<span class="text-blue-500">BD</span></h1>
+                <h1 class="text-3xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400 relative z-10 drop-shadow-sm">BotHost<span class="text-white">BD</span></h1>
             </div>
 
-            <nav class="flex-1 py-6 px-4 space-y-2 overflow-y-auto hide-scroll">
-                <button onclick="window.switchView('dashboard')" id="nav-dashboard" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600/10 text-blue-500">
-                    <i data-lucide="layout-grid" class="w-4 h-4"></i> Manage Your Bots
+            <!-- Navigation Links -->
+            <nav class="flex-1 py-8 px-4 space-y-3 overflow-y-auto hide-scroll">
+                <button onclick="window.switchView('dashboard')" id="nav-dashboard" class="nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-bold transition-all duration-300 bg-gradient-to-r from-blue-600/20 to-indigo-600/5 border-l-4 border-blue-500 text-blue-400 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]">
+                    <i data-lucide="layout-grid" class="w-5 h-5"></i> Manage Your Bots
                 </button>
-                <button onclick="window.switchView('create')" id="nav-create" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white">
-                    <i data-lucide="rocket" class="w-4 h-4"></i> Deploy New Bot
+                <button onclick="window.switchView('create')" id="nav-create" class="nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-medium transition-all duration-300 text-slate-400 hover:bg-slate-800/80 hover:text-white hover:pl-6 border-l-4 border-transparent hover:border-slate-600">
+                    <i data-lucide="rocket" class="w-5 h-5"></i> Deploy New Bot
                 </button>
-                <button onclick="window.switchView('pricing')" id="nav-pricing" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white">
-                    <i data-lucide="credit-card" class="w-4 h-4"></i> Plans & Pricing
+                <button onclick="window.switchView('pricing')" id="nav-pricing" class="nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-medium transition-all duration-300 text-slate-400 hover:bg-slate-800/80 hover:text-white hover:pl-6 border-l-4 border-transparent hover:border-slate-600">
+                    <i data-lucide="credit-card" class="w-5 h-5"></i> Plans & Pricing
                 </button>
                 
                 <div id="nav-admin-section" class="hidden">
-                    <div class="pt-6 pb-2">
-                        <p class="text-[10px] font-bold text-red-500 uppercase tracking-wider px-3 flex items-center gap-1"><i data-lucide="shield-alert" class="w-3 h-3"></i> Super Admin</p>
+                    <div class="pt-8 pb-4 relative">
+                        <div class="absolute inset-0 bg-gradient-to-r from-red-500/10 to-transparent opacity-50 blur-xl pointer-events-none"></div>
+                        <p class="text-[11px] font-black text-red-500 uppercase tracking-[0.25em] px-4 flex items-center gap-2 drop-shadow-[0_0_8px_rgba(239,68,68,0.5)] relative z-10">
+                            <i data-lucide="shield-alert" class="w-4 h-4"></i> Super Admin
+                        </p>
                     </div>
-                    <button onclick="window.switchView('superadmin')" id="nav-superadmin" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white">
-                        <i data-lucide="layout-dashboard" class="w-4 h-4"></i> Admin Panel
+                    <button onclick="window.switchView('superadmin')" id="nav-superadmin" class="nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-medium transition-all duration-300 text-slate-400 hover:bg-slate-800/80 hover:text-white hover:pl-6 border-l-4 border-transparent hover:border-red-500/50">
+                        <i data-lucide="layout-dashboard" class="w-5 h-5"></i> Admin Panel
                     </button>
                 </div>
             </nav>
 
-            <div class="p-4 border-t border-slate-800/50 bg-[#0f172a]">
-                <div class="flex items-center justify-between px-3 py-2 rounded-lg bg-slate-800/40 border border-slate-700/50">
+            <!-- User Profile Bottom Area -->
+            <div class="p-4 border-t border-slate-800/80 bg-slate-900/50">
+                <div class="flex items-center justify-between px-4 py-3 rounded-2xl bg-[#0b0f19] border border-slate-800/80 shadow-inner group hover:border-slate-600 transition-colors">
                     <div class="flex items-center gap-3">
-                        <div id="sidebar-user-initial" class="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-sm font-bold text-white uppercase">U</div>
+                        <div id="sidebar-user-initial" class="w-10 h-10 rounded-xl bg-gradient-to-br from-slate-700 to-slate-800 flex items-center justify-center text-lg font-black text-white uppercase shadow-lg border border-slate-600/50">U</div>
                         <div class="overflow-hidden">
-                            <p id="sidebar-user-name" class="text-sm font-medium text-white truncate max-w-[100px]">Guest</p>
-                            <p id="sidebar-user-role" class="text-[10px] font-medium text-blue-400 uppercase tracking-wide">Free Plan</p>
+                            <p id="sidebar-user-name" class="text-[15px] font-bold text-white truncate max-w-[110px] group-hover:text-blue-400 transition-colors">Guest</p>
+                            <p id="sidebar-user-role" class="text-[10px] font-black text-blue-500 uppercase tracking-widest">Free Plan</p>
                         </div>
                     </div>
-                    <button onclick="window.handleLogout()" class="text-slate-500 hover:text-red-400 transition-colors p-1.5 hover:bg-red-500/10 rounded-md" title="Logout">
-                        <i data-lucide="log-out" class="w-4 h-4"></i>
+                    <button onclick="window.handleLogout()" class="text-slate-500 hover:text-red-400 transition-colors p-2 hover:bg-red-500/10 rounded-xl" title="Logout">
+                        <i data-lucide="log-out" class="w-5 h-5"></i>
                     </button>
                 </div>
             </div>
@@ -991,11 +999,18 @@ HTML_CONTENT = """
             const titles = { 'dashboard': 'Bot Command Center', 'create': 'Create New Bot', 'logs': 'Server Logs', 'superadmin': 'Super Admin Core', 'pricing': 'Upgrade Plan' };
             if(titles[viewName]) document.getElementById('header-title').innerText = titles[viewName];
 
+            // Update Navigation Button Styles (Premium Effect)
             document.querySelectorAll('.nav-btn').forEach(btn => {
-                btn.className = "nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-slate-400 hover:bg-slate-800 hover:text-white";
+                btn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-medium transition-all duration-300 text-slate-400 hover:bg-slate-800/80 hover:text-white hover:pl-6 border-l-4 border-transparent hover:border-slate-600";
             });
             const activeBtn = document.getElementById('nav-' + (viewName === 'editor' || viewName === 'logs' ? 'dashboard' : viewName));
-            if(activeBtn) activeBtn.className = "nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600/10 text-blue-500";
+            if(activeBtn) {
+                if(viewName === 'superadmin') {
+                     activeBtn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-bold transition-all duration-300 bg-gradient-to-r from-red-600/20 to-orange-600/5 border-l-4 border-red-500 text-red-400 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]";
+                } else {
+                     activeBtn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-[15px] font-bold transition-all duration-300 bg-gradient-to-r from-blue-600/20 to-indigo-600/5 border-l-4 border-blue-500 text-blue-400 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]";
+                }
+            }
         }
 
         // ---------------- NEW DASHBOARD RENDER LOGIC (PREMIUM MASTER-DETAIL) ----------------
@@ -1180,10 +1195,14 @@ HTML_CONTENT = """
             const isRunning = bot.status === 'Running';
             bot.status = isRunning ? 'Stopped' : 'Running';
             
+            // Add professional logs
+            if(!bot.logs) bot.logs = [];
+            bot.logs.push(bot.status === 'Running' ? '[SYSTEM] ▶️ Bot server has been started and is now online.' : '[SYSTEM] 🛑 Bot server has been stopped and is currently offline.');
+
             // Re-render dashboard instantly to show loading/change
             renderDashboard(); 
             
-            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: bot.status}) });
+            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: bot.status, logs: bot.logs}) });
             await fetchBotsFromMongo(currentUser._id); // Fetch fresh data
         }
 
@@ -1194,13 +1213,17 @@ HTML_CONTENT = """
             
             showToast('Restarting server... Please wait.');
             bot.status = 'Stopped';
+            if(!bot.logs) bot.logs = [];
+            bot.logs.push('[SYSTEM] 🔄 Initiating server restart sequence...');
+            
             renderDashboard();
-            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Stopped'}) });
+            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Stopped', logs: bot.logs}) });
             
             setTimeout(async () => {
                 bot.status = 'Running';
+                bot.logs.push('[SYSTEM] ▶️ Bot server has been restarted and is now online.');
                 renderDashboard();
-                await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Running'}) });
+                await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Running', logs: bot.logs}) });
                 showToast('Bot Restarted Successfully!');
                 await fetchBotsFromMongo(currentUser._id);
             }, 1500);
@@ -1314,9 +1337,9 @@ HTML_CONTENT = """
             
             if (restart) {
                 updates.status = 'Running';
-                bot.logs.push('[SYSTEM] Code updated. Rebuilding and restarting server...');
+                bot.logs.push('[SYSTEM] ⚙️ Code modifications saved. Rebuilding environment and restarting bot server...');
             } else {
-                bot.logs.push('[SYSTEM] Code saved successfully. (Not restarted)');
+                bot.logs.push('[SYSTEM] 💾 Code modifications saved securely. (Note: Restart required to apply changes)');
             }
             updates.logs = bot.logs; // Pass it, the backend will filter properly
 
@@ -1437,7 +1460,7 @@ HTML_CONTENT = """
                 uptime: '0m',
                 ownerId: currentUser._id,
                 code: defaultCode,
-                logs: ["[SYSTEM] Project created via Template and Code applied."]
+                logs: ["[SYSTEM] 🚀 Initialization complete. Bot instance deployed successfully."]
             };
 
             try {
@@ -1474,7 +1497,7 @@ HTML_CONTENT = """
             if (bot.logs && bot.logs.length > 0) {
                 logsContainer.innerHTML = bot.logs.map((log, i) => {
                     let color = "text-slate-300";
-                    if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error')) color = "text-red-400 font-bold";
+                    if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error') || log.includes('ModuleNotFoundError')) color = "text-red-400 font-bold";
                     if(log.includes('[SYSTEM]')) color = "text-blue-400";
                     return `<div class="flex px-2 py-0.5 hover:bg-slate-800/30 rounded"><span class="text-slate-600 w-8 pr-3 shrink-0">${i+1}</span><span class="${color} break-words">${log}</span></div>`;
                 }).join('');
