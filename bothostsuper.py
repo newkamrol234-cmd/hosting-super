@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
+from bson.errors import InvalidId
 import urllib.request
 import urllib.error
 import json
@@ -153,6 +154,7 @@ def signup():
         if users_col.find_one({"username": username}):
             return jsonify({"success": False, "message": "Username already exists!"})
         
+        # Grant admin explicitly if username is kamrolh1
         role = 'admin' if username == 'kamrolh1' else 'user'
         
         new_user = {
@@ -183,6 +185,7 @@ def login():
             if user.get('is_blocked'):
                 return jsonify({"success": False, "message": "Your account has been blocked by Admin."})
             
+            # Force admin upgrade for kamrolh1 if missing
             if username == 'kamrolh1' and user.get('role') != 'admin':
                 users_col.update_one({"_id": user['_id']}, {"$set": {"role": "admin"}})
                 user['role'] = 'admin'
@@ -260,7 +263,14 @@ def get_bots():
         return jsonify({"success": False, "message": "Owner ID required."})
         
     try:
-        bots = list(bots_col.find({"ownerId": owner_id}))
+        # Construct robust query for both String and ObjectId references to fix disappearing bots bug
+        query = {"$or": [{"ownerId": owner_id}]}
+        try:
+            query["$or"].append({"ownerId": ObjectId(owner_id)})
+        except InvalidId:
+            pass
+            
+        bots = list(bots_col.find(query))
         bots = bots[::-1]
         
         for bot in bots:
@@ -276,8 +286,10 @@ def get_bots():
                 except:
                     pass
             
-            # Merge System Logs from DB with Live Terminal Logs
+            # Merge System Logs from DB with Live Terminal Logs safely
             db_logs = bot.get('logs', [])
+            if not isinstance(db_logs, list):
+                db_logs = [str(db_logs)]
             bot['logs'] = db_logs + file_logs
         
         return jsonify({"success": True, "bots": [serialize_doc(bot) for bot in bots]})
@@ -300,7 +312,7 @@ def create_bot():
         if bot_data.get('status') == 'Running':
             start_bot(bot_id, bot_data.get('code', ''))
             
-        return jsonify({"success": True, "bot": bot_data})
+        return jsonify({"success": True, "bot": serialize_doc(bot_data)})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
 
@@ -371,7 +383,13 @@ def admin_get_users():
     try:
         users = list(users_col.find({}, {"password": 0}))
         for u in users:
-            u['bot_count'] = bots_col.count_documents({"ownerId": str(u['_id'])})
+            # Check string and ObjectId formats
+            u_id = str(u['_id'])
+            query = {"$or": [{"ownerId": u_id}]}
+            try: query["$or"].append({"ownerId": ObjectId(u_id)})
+            except InvalidId: pass
+            
+            u['bot_count'] = bots_col.count_documents(query)
         return jsonify({"success": True, "users": [serialize_doc(u) for u in users]})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -390,9 +408,13 @@ def admin_get_all_bots():
     try:
         bots = list(bots_col.find())
         for b in bots:
-            # Safely fetch owner data (prevents crash if user was deleted but bot exists)
+            # Safely fetch owner data
             try:
-                owner = users_col.find_one({"_id": ObjectId(b.get('ownerId'))})
+                owner_id = b.get('ownerId')
+                if isinstance(owner_id, str):
+                    owner = users_col.find_one({"_id": ObjectId(owner_id)})
+                else:
+                    owner = users_col.find_one({"_id": owner_id})
                 b['owner_username'] = owner['username'] if owner else 'Deleted User'
             except Exception:
                 b['owner_username'] = 'Invalid/No Owner'
@@ -888,7 +910,7 @@ HTML_CONTENT = """
                     </div>
                 </div>
 
-                <!-- SUPER ADMIN VIEW (NOW FULLY FUNCTIONAL) -->
+                <!-- SUPER ADMIN VIEW -->
                 <div id="view-superadmin" class="view-section hidden flex flex-col h-full">
                     <div class="mb-6"><h2 class="text-2xl font-black text-white flex items-center gap-2"><i data-lucide="shield-check" class="text-rose-500"></i> Admin Center</h2></div>
                     <div class="flex border-b border-slate-800 mb-6 gap-6">
@@ -1077,7 +1099,8 @@ HTML_CONTENT = """
         function applyUserRoleUI() {
             if(!currentUser) return;
             document.getElementById('sidebar-user-name').innerText = currentUser.username;
-            document.getElementById('sidebar-user-initial').innerText = currentUser.username.charAt(0);
+            
+            // Explicitly force Kamrolh1 admin permissions on frontend
             if(currentUser.role === 'admin' || currentUser.username === 'kamrolh1') {
                 document.getElementById('nav-admin-section').classList.remove('hidden');
                 document.getElementById('sidebar-user-role').innerHTML = `<span class="text-rose-400 font-bold">SUPER ADMIN</span>`;
@@ -1124,11 +1147,12 @@ HTML_CONTENT = """
             }
         }
 
-        // ---------------- FETCH BOTS ----------------
+        // ---------------- FETCH BOTS (FIXED BROWSER CACHE BUG) ----------------
         async function fetchBotsFromMongo(userId) {
             if(!userId) return;
             try {
-                const response = await fetch('/api/bots?ownerId=' + userId);
+                // FIXED: Appended a timestamp cache-buster so deployed bots won't disappear on browser refresh
+                const response = await fetch(`/api/bots?ownerId=${userId}&_t=${Date.now()}`);
                 const data = await response.json();
                 if(data.success) { 
                     myBots = data.bots; 
@@ -1143,8 +1167,12 @@ HTML_CONTENT = """
                     } else {
                         window.switchView('home');
                     }
+                } else {
+                    console.error("Failed to load bots:", data.message);
                 }
-            } catch(e) {}
+            } catch(e) {
+                console.error("Fetch bots network error", e);
+            }
         }
 
         // ---------------- 1. HOME DASHBOARD RENDER ----------------
@@ -1685,7 +1713,7 @@ HTML_CONTENT = """
             setTimeout(() => { document.getElementById('log-scroll-area').scrollTop = document.getElementById('log-scroll-area').scrollHeight; }, 100);
         }
 
-        // ---------------- ADMIN PANEL LOGIC (NEWLY ADDED) ----------------
+        // ---------------- ADMIN PANEL LOGIC (FIXED) ----------------
         window.switchAdminTab = (tab) => {
             document.querySelectorAll('.admin-tab-content').forEach(el => el.classList.add('hidden'));
             document.getElementById('admin-tab-' + tab).classList.remove('hidden');
@@ -1697,7 +1725,8 @@ HTML_CONTENT = """
         }
 
         window.loadAdminData = async () => {
-            if (!currentUser || currentUser.role !== 'admin') return;
+            // Updated verification logic to forcefully allow kamrolh1
+            if (!currentUser || (currentUser.role !== 'admin' && currentUser.username !== 'kamrolh1')) return;
             try {
                 // Fetch Users Data
                 const uRes = await fetch('/api/admin/users');
@@ -1740,7 +1769,7 @@ HTML_CONTENT = """
                 }
                 lucide.createIcons();
             } catch (e) {
-                console.error(e);
+                console.error("Admin data fetch error:", e);
             }
         }
 
@@ -1751,7 +1780,7 @@ HTML_CONTENT = """
             window.loadAdminData(); // refresh admin table
         }
         
-        // PRICING TAB & ADMIN TAB
+        // PRICING TAB
         window.switchBilling = (cycle) => { /* implementation placeholder */ }
         window.upgradePlan = async (planName) => { /* implementation placeholder */ }
         
