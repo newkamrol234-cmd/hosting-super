@@ -13,6 +13,7 @@ import subprocess
 import sys
 import atexit
 import signal
+from collections import deque
 
 app = Flask(__name__)
 
@@ -46,7 +47,7 @@ active_processes = {}
 def start_bot(bot_id, code):
     """Starts the bot in a separate background process."""
     stop_bot(bot_id)  # Stop any existing instance first completely
-    time.sleep(1.5) # Give OS a moment to release ports/files
+    time.sleep(0.1) # Give OS a moment to release ports/files (Reduced to 0.1 for instant start)
     
     # If code is somehow empty, try to fetch it from DB safely
     if not code or not code.strip():
@@ -63,18 +64,23 @@ def start_bot(bot_id, code):
         f.write(code)
         
     # Open log file to capture print statements and errors
-    log_file = open(log_path, "w", encoding="utf-8")
+    log_file = open(log_path, "a", encoding="utf-8")
     
     try:
-        # Added "-u" (unbuffered) flag so Python flushes print statements directly to the log file instantly
+        # Force UTF-8 encoding for the subprocess
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        
         proc = subprocess.Popen(
-            [sys.executable, "-u", script_path],
+            [sys.executable, "-X", "utf8", "-u", script_path], 
             stdout=log_file,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
+            env=env
         )
         active_processes[bot_id] = {'proc': proc, 'log_file': log_file}
         
-        # Securely save the PID to file for cross-thread killing
+        # Securely save the PID to file
         with open(pid_path, "w") as f:
             f.write(str(proc.pid))
             
@@ -91,10 +97,9 @@ def stop_bot(bot_id):
         proc_info = active_processes[bot_id]
         proc = proc_info['proc']
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
+            proc.kill() # Kill instantly to remove delay
         except:
-            proc.kill()
+            pass
         try:
             proc_info['log_file'].close()
         except:
@@ -263,7 +268,7 @@ def get_bots():
         return jsonify({"success": False, "message": "Owner ID required."})
         
     try:
-        # Construct robust query for both String and ObjectId references to fix disappearing bots bug
+        # Construct robust query for both String and ObjectId references
         query = {"$or": [{"ownerId": owner_id}]}
         try:
             query["$or"].append({"ownerId": ObjectId(owner_id)})
@@ -277,16 +282,17 @@ def get_bots():
             bot_id_str = str(bot['_id'])
             log_path = os.path.join(BOTS_DIR, f"{bot_id_str}.log")
             
-            # Read the real physical log file
+            # Read the real physical log file efficiently
             file_logs = []
             if os.path.exists(log_path):
                 try:
-                    with open(log_path, "r", encoding="utf-8") as f:
-                        file_logs = f.read().splitlines()[-100:] 
+                    with open(log_path, "r", encoding="utf-8", errors='replace') as f:
+                        file_logs = list(deque(f, maxlen=100))
+                        file_logs = [line.rstrip('\n') for line in file_logs]
                 except:
                     pass
             
-            # Merge System Logs from DB with Live Terminal Logs safely
+            # Merge System Logs from DB with Live Terminal Logs
             db_logs = bot.get('logs', [])
             if not isinstance(db_logs, list):
                 db_logs = [str(db_logs)]
@@ -301,7 +307,7 @@ def create_bot():
     try:
         bot_data = request.json
         
-        # Prevent duplicate deployments completely
+        # Prevent duplicate deployments
         if bots_col.find_one({"token": bot_data.get('token')}):
             return jsonify({"success": False, "message": "Bot is already deployed on the server!"})
             
@@ -322,11 +328,21 @@ def update_bot(bot_id):
         update_data = request.json
         if '_id' in update_data: del update_data['_id']
         
-        if 'logs' in update_data:
-            update_data['logs'] = [l for l in update_data['logs'] if isinstance(l, str) and l.startswith('[SYSTEM]')]
-        
+        # 🛑 CLEAR PHYSICAL LOGS: Deletes old logs when Save or Restart is triggered
+        log_path = os.path.join(BOTS_DIR, f"{bot_id}.log")
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("") # Truncate/clear file
+        except Exception:
+            pass
+
         bot = bots_col.find_one({"_id": ObjectId(bot_id)})
         new_code = update_data.get('code', bot.get('code', ''))
+        
+        if 'code' in update_data:
+            script_path = os.path.join(BOTS_DIR, f"{bot_id}.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(update_data['code'])
         
         bots_col.update_one({"_id": ObjectId(bot_id)}, {"$set": update_data})
         
@@ -383,7 +399,6 @@ def admin_get_users():
     try:
         users = list(users_col.find({}, {"password": 0}))
         for u in users:
-            # Check string and ObjectId formats
             u_id = str(u['_id'])
             query = {"$or": [{"ownerId": u_id}]}
             try: query["$or"].append({"ownerId": ObjectId(u_id)})
@@ -408,7 +423,6 @@ def admin_get_all_bots():
     try:
         bots = list(bots_col.find())
         for b in bots:
-            # Safely fetch owner data
             try:
                 owner_id = b.get('ownerId')
                 if isinstance(owner_id, str):
@@ -428,8 +442,8 @@ def admin_system_status():
     return jsonify({
         "success": True,
         "nodes": [
-            {"name": "Worker-Node-1", "status": "Healthy", "cpu": f"{random.randint(20, 60)}%", "ram": f"{random.randint(2, 6)}GB / 16GB"},
-            {"name": "Worker-Node-2", "status": "Healthy", "cpu": f"{random.randint(10, 40)}%", "ram": f"{random.randint(1, 4)}GB / 16GB"}
+            {"name": "Worker-Node-1", "status": "Healthy", "cpu": f"{random.randint(20, 80)}%", "ram": f"{random.randint(8, 24)}GB / 64GB"},
+            {"name": "Worker-Node-2", "status": "Healthy", "cpu": f"{random.randint(10, 60)}%", "ram": f"{random.randint(4, 16)}GB / 64GB"}
         ],
         "queue": {
             "pending_builds": random.randint(0, 3),
@@ -484,6 +498,15 @@ HTML_CONTENT = """
         <p class="text-slate-400 text-sm font-medium animate-pulse">Initializing secure connection...</p>
     </div>
 
+    <!-- INSTALLATION MODAL -->
+    <div id="install-modal" class="fixed inset-0 z-[150] flex items-center justify-center bg-[#060913]/90 backdrop-blur-md hidden opacity-0 transition-all duration-300">
+        <div class="bg-[#12182b] border border-slate-800 rounded-3xl p-8 max-w-lg w-full shadow-[0_0_80px_rgba(99,102,241,0.15)] transform scale-95 transition-transform duration-300" id="install-modal-content">
+            <div id="install-modal-body" class="text-center">
+                <!-- Content dynamically injected here -->
+            </div>
+        </div>
+    </div>
+
     <!-- BIG SUCCESS OVERLAY -->
     <div id="big-success-overlay" class="fixed inset-0 z-[100] flex items-center justify-center bg-[#060913]/80 backdrop-blur-md opacity-0 pointer-events-none transition-all duration-500">
         <div class="bg-gradient-to-b from-green-900/40 to-[#0f172a] border border-green-500/50 p-10 rounded-3xl shadow-[0_0_80px_rgba(34,197,94,0.2)] text-center transform scale-75 transition-transform duration-500 max-w-sm w-full" id="big-success-content">
@@ -496,7 +519,7 @@ HTML_CONTENT = """
         </div>
     </div>
 
-    <!-- LOGIN MODAL CONTAINER (FULL SCREEN HIDDEN BY DEFAULT) -->
+    <!-- LOGIN MODAL CONTAINER -->
     <div id="login-container" class="fixed inset-0 z-50 flex items-center justify-center bg-[#060913] hidden opacity-0 transition-opacity duration-500">
         <div id="login-content" class="w-full max-w-sm bg-[#12182b] border border-slate-800 rounded-3xl p-8 shadow-[0_0_50px_rgba(99,102,241,0.15)] relative transform scale-95 translate-y-4 transition-all duration-300">
             <div class="text-center mb-8">
@@ -1147,11 +1170,10 @@ HTML_CONTENT = """
             }
         }
 
-        // ---------------- FETCH BOTS (FIXED BROWSER CACHE BUG) ----------------
+        // ---------------- FETCH BOTS ----------------
         async function fetchBotsFromMongo(userId) {
             if(!userId) return;
             try {
-                // FIXED: Appended a timestamp cache-buster so deployed bots won't disappear on browser refresh
                 const response = await fetch(`/api/bots?ownerId=${userId}&_t=${Date.now()}`);
                 const data = await response.json();
                 if(data.success) { 
@@ -1367,17 +1389,20 @@ HTML_CONTENT = """
             const isRunning = bot.status === 'Running';
             bot.status = isRunning ? 'Stopped' : 'Running';
             
-            if(!bot.logs) bot.logs = [];
-            bot.logs.push(bot.status === 'Running' ? '[SYSTEM] ▶️ Bot server has been started and is now online.' : '[SYSTEM] 🛑 Bot server has been stopped and is currently offline.');
+            // Short logs
+            const customLogs = isRunning ? 
+                ["🛑 Bot stopped."] : 
+                ["🚀 Bot is running..."];
+            bot.logs = customLogs;
 
             renderDashboard(); 
             
             await fetch('/api/bots/' + id, { 
                 method: 'PUT', 
                 headers: { 'Content-Type': 'application/json' }, 
-                body: JSON.stringify({ status: bot.status, logs: bot.logs, code: bot.code }) 
+                body: JSON.stringify({ status: bot.status, logs: customLogs, code: bot.code }) 
             });
-            await fetchBotsFromMongo(currentUser._id); 
+            fetchBotsFromMongo(currentUser._id); 
         }
 
         // Restart Bot 
@@ -1385,27 +1410,25 @@ HTML_CONTENT = """
             const bot = myBots.find(b => b._id === id);
             if(!bot || bot.status !== 'Running') return;
             
-            showToast('Restarting server... Please wait.');
-            bot.status = 'Stopped';
-            if(!bot.logs) bot.logs = [];
-            bot.logs.push('[SYSTEM] 🔄 Initiating server restart sequence...');
+            showToast('Restarting server...');
+            
+            // Instant restart without delay and short logs
+            const customLogs = [
+                "🔄 Restarting...",
+                "🚀 Bot is running..."
+            ];
+            bot.logs = customLogs;
             
             renderDashboard();
-            await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({status: 'Stopped', logs: bot.logs}) });
             
-            setTimeout(async () => {
-                bot.status = 'Running';
-                bot.logs.push('[SYSTEM] ▶️ Bot server has been restarted and is now online.');
-                renderDashboard();
-                
-                await fetch('/api/bots/' + id, { 
-                    method: 'PUT', 
-                    headers: { 'Content-Type': 'application/json' }, 
-                    body: JSON.stringify({ status: 'Running', logs: bot.logs, code: bot.code }) 
-                });
-                showToast('Bot Restarted Successfully!');
-                await fetchBotsFromMongo(currentUser._id);
-            }, 1500); 
+            await fetch('/api/bots/' + id, { 
+                method: 'PUT', 
+                headers: { 'Content-Type': 'application/json' }, 
+                body: JSON.stringify({ status: 'Running', logs: customLogs, code: bot.code }) 
+            });
+            
+            showToast('Bot Restarted Successfully!');
+            fetchBotsFromMongo(currentUser._id);
         }
 
         // Delete Bot
@@ -1418,20 +1441,40 @@ HTML_CONTENT = """
             fetchBotsFromMongo(currentUser._id);
         }
 
-        // ---------------- PACKAGE INSTALL LOGIC ----------------
+        // ---------------- PACKAGE INSTALL LOGIC (MODAL) ----------------
+        window.closeInstallModal = () => {
+            const modal = document.getElementById('install-modal');
+            const modalContent = document.getElementById('install-modal-content');
+            modal.classList.add('opacity-0');
+            modalContent.classList.replace('scale-100', 'scale-95');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 300);
+        };
+
         window.installPackage = async (botId) => {
             const pkgInput = document.getElementById(`pkg-${botId}`);
             if(!pkgInput) return;
             const pkg = pkgInput.value.trim();
             if(!pkg) return showToast("Please enter a package name", true);
             
-            const btn = pkgInput.nextElementSibling;
-            const origHtml = btn.innerHTML;
-            btn.innerHTML = `<i data-lucide="loader" class="w-4 h-4 animate-spin"></i>`;
-            btn.disabled = true;
-            lucide.createIcons();
+            // Show Big Loading Modal
+            const modal = document.getElementById('install-modal');
+            const modalContent = document.getElementById('install-modal-content');
+            const modalBody = document.getElementById('install-modal-body');
 
-            showToast(`Installing ${pkg}. This might take a few seconds...`);
+            modalBody.innerHTML = `
+                <div class="w-24 h-24 mx-auto border-4 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin mb-6 shadow-[0_0_30px_rgba(99,102,241,0.4)]"></div>
+                <h3 class="text-2xl font-black text-white mb-2">Installing Package</h3>
+                <p class="text-indigo-400 font-mono bg-indigo-500/10 inline-block px-3 py-1 rounded-lg">pip install ${pkg}</p>
+                <p class="text-slate-400 text-sm mt-4 font-medium animate-pulse">Resolving dependencies, please wait...</p>
+            `;
+
+            modal.classList.remove('hidden');
+            void modal.offsetWidth; // force reflow
+            modal.classList.remove('opacity-0');
+            modalContent.classList.replace('scale-95', 'scale-100');
+            
             try {
                 const res = await fetch(`/api/bots/${botId}/install`, {
                     method: 'POST',
@@ -1439,19 +1482,42 @@ HTML_CONTENT = """
                     body: JSON.stringify({package: pkg})
                 });
                 const data = await res.json();
+                
                 if(data.success) {
-                    showBigSuccess(`${pkg} has been installed successfully!`);
+                    modalBody.innerHTML = `
+                        <div class="w-24 h-24 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-emerald-500 shadow-[0_0_30px_rgba(16,185,129,0.4)] transform scale-100 transition-transform duration-500 hover:scale-110">
+                            <i data-lucide="check-circle" class="w-12 h-12 text-emerald-400"></i>
+                        </div>
+                        <h3 class="text-3xl font-black text-white mb-3">Success!</h3>
+                        <div class="bg-[#0b101e] border border-emerald-500/30 rounded-xl p-4 mb-8">
+                            <p class="text-emerald-400 font-mono text-sm">${pkg} installed successfully.</p>
+                        </div>
+                        <button onclick="window.closeInstallModal()" class="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold transition-all shadow-lg hover:shadow-emerald-500/25">Done</button>
+                    `;
                     pkgInput.value = '';
                 } else {
-                    showToast(`Failed: ${data.message}`, true);
+                    modalBody.innerHTML = `
+                        <div class="w-24 h-24 bg-rose-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-rose-500 shadow-[0_0_30px_rgba(244,63,94,0.4)] transform scale-100 transition-transform duration-500 hover:scale-110">
+                            <i data-lucide="x-circle" class="w-12 h-12 text-rose-400"></i>
+                        </div>
+                        <h3 class="text-3xl font-black text-white mb-3">Install Failed</h3>
+                        <div class="bg-[#0b101e] border border-rose-500/30 rounded-xl p-4 mb-8 max-h-48 overflow-y-auto custom-scroll text-left">
+                            <p class="text-rose-400 font-mono text-xs whitespace-pre-wrap">${data.message || 'Unknown error occurred.'}</p>
+                        </div>
+                        <button onclick="window.closeInstallModal()" class="w-full py-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-xl font-bold transition-all">Close & Try Again</button>
+                    `;
                 }
             } catch(e) {
-                showToast("Install error! Check your connection.", true);
-            } finally {
-                btn.innerHTML = origHtml;
-                btn.disabled = false;
-                lucide.createIcons();
+                modalBody.innerHTML = `
+                    <div class="w-24 h-24 bg-rose-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-rose-500 shadow-[0_0_30px_rgba(244,63,94,0.4)]">
+                        <i data-lucide="alert-triangle" class="w-12 h-12 text-rose-400"></i>
+                    </div>
+                    <h3 class="text-2xl font-black text-white mb-2">Network Error</h3>
+                    <p class="text-rose-400 text-sm mb-8">Failed to connect to the server. Please check your internet connection.</p>
+                    <button onclick="window.closeInstallModal()" class="w-full py-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-xl font-bold transition-colors">Close</button>
+                `;
             }
+            lucide.createIcons();
         };
 
         // ---------------- EDITOR LOGIC ----------------
@@ -1466,7 +1532,7 @@ HTML_CONTENT = """
             textArea.value = bot.code || '';
             
             const updateLineCount = () => {
-                const lines = textArea.value.split('\\n').length;
+                const lines = textArea.value.split('\n').length;
                 document.getElementById('editor-line-count').innerText = `Lines: ${lines}`;
             };
             textArea.oninput = updateLineCount;
@@ -1478,7 +1544,7 @@ HTML_CONTENT = """
                     let color = "text-slate-400";
                     if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error') || log.includes('ModuleNotFoundError')) color = "text-rose-400";
                     if(log.includes('[SUCCESS]')) color = "text-emerald-400";
-                    if(log.includes('[SYSTEM]')) color = "text-indigo-400";
+                    if(log.includes('[SYSTEM]') || log.includes('মঙ্গোডিবি') || log.includes('বট')) color = "text-indigo-400";
                     return `<div class="${color} break-words py-0.5">${log}</div>`;
                 }).join('');
             } else {
@@ -1501,16 +1567,16 @@ HTML_CONTENT = """
             btn.innerHTML = `<i data-lucide="loader" class="w-4 h-4 animate-spin"></i> Saving...`;
             lucide.createIcons();
 
-            const updates = { code: code };
-            if(!bot.logs) bot.logs = [];
+            // Very short logs to avoid spam
+            const customLogs = restart ? 
+                ["💾 Code saved.", "🚀 Bot restarting..."] : 
+                ["💾 Code saved. (Restart needed)"];
+
+            const updates = { code: code, logs: customLogs };
             
             if (restart) {
                 updates.status = 'Running';
-                bot.logs.push('[SYSTEM] ⚙️ Code modifications saved. Rebuilding environment and restarting bot server...');
-            } else {
-                bot.logs.push('[SYSTEM] 💾 Code modifications saved securely. (Note: Restart required to apply changes)');
             }
-            updates.logs = bot.logs; 
 
             try {
                 const response = await fetch('/api/bots/' + bot._id, {
@@ -1522,17 +1588,25 @@ HTML_CONTENT = """
                 
                 if(data.success) {
                     bot.code = code;
+                    bot.logs = customLogs; // Update local state immediately
                     if(restart) bot.status = 'Running';
+                    
                     showToast(restart ? "Saved and Restarted successfully!" : "Code saved.");
-                    await fetchBotsFromMongo(currentUser._id);
+                    
+                    // NO DELAY: Refresh UI immediately without waiting for Mongo
+                    window.openEditor(bot._id);
+                    
+                    // Fetch silently in background
+                    fetchBotsFromMongo(currentUser._id);
+                } else {
+                    showToast("Save Failed: " + data.message, true);
                 }
             } catch (err) {
-                showToast("Failed to save code.", true);
+                showToast("Network Error: Failed to save code.", true);
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = originalHtml;
                 lucide.createIcons();
-                window.openEditor(bot._id);
             }
         }
 
@@ -1659,8 +1733,8 @@ HTML_CONTENT = """
                 token: wizardData.token,
                 type: 'Python 3.11', 
                 status: 'Running',
-                ramUsage: '120MB / 512MB',
-                cpuUsage: '5%',
+                ramUsage: '1.2GB / 8.0GB',
+                cpuUsage: 'High (Uncapped)',
                 uptime: '0m',
                 ownerId: currentUser._id,
                 code: defaultCode,
@@ -1703,7 +1777,7 @@ HTML_CONTENT = """
                 logsContainer.innerHTML = bot.logs.map((log, i) => {
                     let color = "text-slate-300";
                     if(log.includes('[ERROR]') || log.includes('Exception') || log.includes('Error') || log.includes('ModuleNotFoundError')) color = "text-rose-400 font-bold";
-                    if(log.includes('[SYSTEM]')) color = "text-indigo-400";
+                    if(log.includes('[SYSTEM]') || log.includes('মঙ্গোডিবি') || log.includes('বট')) color = "text-indigo-400";
                     return `<div class="flex px-2 py-0.5 hover:bg-slate-800/30 rounded"><span class="text-slate-600 w-8 pr-3 shrink-0">${i+1}</span><span class="${color} break-words">${log}</span></div>`;
                 }).join('');
             } else {
@@ -1713,7 +1787,7 @@ HTML_CONTENT = """
             setTimeout(() => { document.getElementById('log-scroll-area').scrollTop = document.getElementById('log-scroll-area').scrollHeight; }, 100);
         }
 
-        // ---------------- ADMIN PANEL LOGIC (FIXED) ----------------
+        // ---------------- ADMIN PANEL LOGIC ----------------
         window.switchAdminTab = (tab) => {
             document.querySelectorAll('.admin-tab-content').forEach(el => el.classList.add('hidden'));
             document.getElementById('admin-tab-' + tab).classList.remove('hidden');
@@ -1725,7 +1799,6 @@ HTML_CONTENT = """
         }
 
         window.loadAdminData = async () => {
-            // Updated verification logic to forcefully allow kamrolh1
             if (!currentUser || (currentUser.role !== 'admin' && currentUser.username !== 'kamrolh1')) return;
             try {
                 // Fetch Users Data
